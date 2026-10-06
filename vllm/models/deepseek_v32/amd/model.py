@@ -9,6 +9,9 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.fused_moe.utils import (
+    is_model_fused_shared_expert_compatible,
+)
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -221,12 +224,30 @@ class DeepseekV32Model(torch.nn.Module):
             ("wk_weights_proj", "wk", 0),
             ("wk_weights_proj", "weights_proj", 1),
         ]
+        # With VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS the MoE layers carry
+        # the shared experts as extra routed experts after the real ones, and
+        # have no separate shared-expert parameters: their checkpoint weights
+        # load into those slots, as the MTP module's loader already does.
+        fused_shared = is_model_fused_shared_expert_compatible(
+            self.layers, DeepseekV2MoE, "mlp")
+        n_shared = getattr(self.config, "n_shared_experts", 1) or 1
+        # The mapping below numbers the shared slots right after the logical
+        # routed experts, but the runtime allocates them after ALL physical
+        # routed experts (replicas included, see expert_map_manager.py), so
+        # the two disagree once EPLB adds redundant experts. Refuse that
+        # combination instead of loading shared weights into routed replicas.
+        if fused_shared and self.num_redundant_experts > 0:
+            raise ValueError(
+                "fused shared experts are not supported with redundant experts "
+                "(EPLB) on this path: "
+                f"num_redundant_experts={self.num_redundant_experts}"
+            )
         expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.n_routed_experts + (n_shared if fused_shared else 0),
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -247,6 +268,46 @@ class DeepseekV32Model(torch.nn.Module):
                 loaded_params,
                 pp_missing_layer_names,
             ):
+                continue
+
+            fused_shared_weight = fused_shared and "mlp.shared_experts" in name
+            if fused_shared_weight:
+                if is_pp_missing_parameter(name, self):
+                    continue
+                split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0
+                total = loaded_weight.shape[split_dim]
+                if total % n_shared != 0:
+                    raise ValueError(
+                        f"fused shared-expert weight {name!r} has size {total} "
+                        f"along axis {split_dim}, not divisible by "
+                        f"n_shared_experts={n_shared}."
+                    )
+                chunk = total // n_shared
+                for j in range(n_shared):
+                    piece = loaded_weight.narrow(split_dim if loaded_weight.ndim > 1 else 0,
+                                                 j * chunk, chunk)
+                    expert_name = name.replace(
+                        "mlp.shared_experts", f"mlp.experts.{self.config.n_routed_experts + j}")
+                    matched = False
+                    for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+                        if weight_name not in expert_name:
+                            continue
+                        matched = True
+                        name_mapped = expert_name.replace(weight_name, param_name)
+                        param = params_dict[name_mapped]
+                        if typing.cast(Callable[..., bool], param.weight_loader)(
+                                param, piece, name_mapped, shard_id=shard_id,
+                                expert_id=expert_id, return_success=True):
+                            loaded_params.add(name_mapped)
+                            break
+                    # A matched mapping whose loader declined is a non-local
+                    # expert: skip it. No match at all is an unknown shared
+                    # expert weight, which must not be dropped silently.
+                    if not matched:
+                        raise ValueError(
+                            f"fused shared-expert weight {name!r} matches no "
+                            "gate_proj/up_proj/down_proj expert mapping"
+                        )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
